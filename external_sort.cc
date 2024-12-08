@@ -137,7 +137,8 @@ seastar::future<> MergeChunks(std::string filename, std::vector<FileChunk> chunk
 
 std::vector<FileChunk> Chunkify(int64_t offset, int64_t length) {
     std::vector<FileChunk> chunks;
-    int64_t max_chunk_length = length / kMergeFactor;
+    int64_t max_blocks_in_chunk = std::ceil((static_cast<double>(length / kMergeFactor) / kBlobSize));
+    int64_t max_chunk_length = max_blocks_in_chunk * kBlobSize;
     int64_t current = offset;
     while (current < (offset + length)) {
         int64_t chunk_offset = current;
@@ -178,7 +179,7 @@ seastar::future<> ExternalSort(const std::string& filename, FileChunk chunk, std
                                                                     seastar::temporary_buffer<char>& buf,
                                                                     seastar::file& of) {
                         int64_t num_values = output_indexes.size();
-                        // TODO: This is still not optimal as we arewriting
+                        // TODO: This is still not optimal as we are writing
                         // 4Kib chunks at a time. Suspecting some sort of
                         // batching would be very helpful.
                         return seastar::parallel_for_each(boost::counting_iterator<int64_t>(0),
