@@ -14,7 +14,7 @@
 using namespace std::chrono_literals;
 
 constexpr int64_t kBlobSize = 4096;
-constexpr int64_t kMergeFactor = 5;
+constexpr int64_t kMergeFactor = 64;
 constexpr char kSortedFileSuffix[] = ".sorted";
 
 int64_t AvailableRam() {
@@ -39,7 +39,7 @@ struct MergeChunkInfo {
     std::string filename;
     int64_t pos = 0;
     int64_t length = 0;
-    std::optional<seastar::temporary_buffer<char>> next_value;
+    std::optional<std::string> next_value;
     MergeChunkInfo(seastar::file f, std::string filename, int64_t length) :
         file(std::move(f)), filename(filename), length(length) {}
 
@@ -48,7 +48,7 @@ struct MergeChunkInfo {
 
         return file.dma_read<char>(pos, kBlobSize).then([this](seastar::temporary_buffer<char> buf) {
             // TODO: error handling.
-            next_value = std::move(buf);
+            next_value = std::string(buf.get(), kBlobSize);
             pos += kBlobSize;
         });
     }
@@ -77,7 +77,7 @@ struct MergeInfo {
     }
 };
 
-seastar::future<> MergeChunks(std::string filename, std::vector<FileChunk> chunks, std::string out_filename) {
+seastar::future<> MergeChunks(std::string filename, std::vector<FileChunk>& chunks, std::string out_filename) {
     std::cout << "Merging " << chunks.size() << " chunks" << std::endl;
     return seastar::open_file_dma(out_filename, seastar::open_flags::rw | seastar::open_flags::create)
             .then([filename, chunks, out_filename] (seastar::file of) {
@@ -106,16 +106,15 @@ seastar::future<> MergeChunks(std::string filename, std::vector<FileChunk> chunk
                                 merge_info.min_value_chunk = &ci;
                                 return seastar::make_ready_future<>(); 
                             }
-                            const char* existing_min_value = merge_info.min_value_chunk->next_value.value().get();
-                            const char* current_value = ci.next_value.value().get();
-                            if (!std::lexicographical_compare(existing_min_value, existing_min_value + kBlobSize,
-                                                              current_value, current_value + kBlobSize)) {
+                            const std::string& existing_min_value = merge_info.min_value_chunk->next_value.value();
+                            const std::string& current_value = ci.next_value.value();
+                            if (current_value < existing_min_value) {
                                 merge_info.min_value_chunk = &ci;
                             }
                             return seastar::make_ready_future<>();
                         });
                     }).then([&merge_info]() {
-                        const char* src_pos = merge_info.min_value_chunk->next_value.value().get();
+                        const char* src_pos = merge_info.min_value_chunk->next_value.value().data();
                         return merge_info.out_file.dma_write(/*pos=*/merge_info.out_file_pos, src_pos, kBlobSize)
                                .then([&merge_info] (size_t) {
                             merge_info.out_file_pos += kBlobSize;
@@ -153,41 +152,35 @@ std::vector<FileChunk> Chunkify(int64_t offset, int64_t length) {
 // can be sorted in-memory, then performs recursive merging of these shards.
 seastar::future<> ExternalSort(const std::string& filename, FileChunk chunk, std::string out_filename) {
     // Sort the full chunk it's small enough. Although we should try to fully
-    // utilize free memory, naively using only half of the memory to loosely
-    // account for other allocations. We can do better here.
-    if (chunk.length * 2 <= AvailableRam()) {
+    // utilize free memory, naively using only third of the memory as we will
+    // make a copy from the read buffer, and also to loosely account for other
+    // allocations. We can do better here.
+    if (chunk.length * 3 <= AvailableRam()) {
         std::cout << "Sorting chunk [" << chunk.offset << "," << chunk.length << "] in memory" << std::endl;
         return seastar::open_file_dma(filename, seastar::open_flags::rw).then([chunk, out_filename](seastar::file f) {
             return f.dma_read<char>(static_cast<uint64_t>(chunk.offset), static_cast<size_t>(chunk.length)).then(
                     [chunk, out_filename] (seastar::temporary_buffer<char> buf) {
                 assert(chunk.length % kBlobSize == 0);
-                std::vector<std::string_view> blobrefs;
+                std::vector<std::string> blobs;
                 int64_t num_blobs = chunk.length / kBlobSize;
-                std::vector<int64_t> output_indexes(num_blobs);
-                std::iota(std::begin(output_indexes), std::end(output_indexes), 0);
-                auto comparator = [&blobrefs](const int64_t& a, const int64_t& b) {
-                    return blobrefs[a] < blobrefs[b];
-                };
                 for (int64_t i = 0; i < num_blobs; ++i) {
-                    blobrefs.push_back(std::string_view());
+                    blobs.push_back(std::string(buf.get() + (i * kBlobSize), kBlobSize));
                 }
-                std::sort(output_indexes.begin(), output_indexes.end(), comparator);
+                std::sort(blobs.begin(), blobs.end());
                 return seastar::open_file_dma(out_filename, seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::truncate)
-                        .then([output_indexes, &buf](seastar::file of) {
-                    return seastar::do_with(std::move(output_indexes), std::move(buf), std::move(of),
-                                            [](std::vector<int64_t>& output_indexes,
-                                                                    seastar::temporary_buffer<char>& buf,
+                        .then([blobs = std::move(blobs)](seastar::file of) {
+                    return seastar::do_with(std::move(blobs), std::move(of),
+                                            [](std::vector<std::string>& blobs,
                                                                     seastar::file& of) {
-                        int64_t num_values = output_indexes.size();
+                        int64_t num_values = blobs.size();
                         // TODO: This is still not optimal as we are writing
                         // 4Kib chunks at a time. Suspecting some sort of
                         // batching would be very helpful.
                         return seastar::parallel_for_each(boost::counting_iterator<int64_t>(0),
                                                     boost::counting_iterator<int64_t>(num_values),
-                                                    [&output_indexes, &buf, &of](int64_t i) {
-                            size_t output_pos = output_indexes[i] * kBlobSize;
-                            const char* input_pos = buf.get() + (i * kBlobSize);
-                            return of.dma_write<char>(output_pos, input_pos, kBlobSize).then([](size_t) {
+                                                    [&blobs, &of](int64_t i) {
+                            size_t output_pos = i * kBlobSize;
+                            return of.dma_write<char>(output_pos, blobs[i].data(), kBlobSize).then([output_pos](size_t) {
                                 return seastar::make_ready_future<>();
                             });
                         });         
@@ -204,7 +197,7 @@ seastar::future<> ExternalSort(const std::string& filename, FileChunk chunk, std
         return seastar::do_for_each(chunks, [filename, out_filename](FileChunk c) {
             const std::string chunk_out_filename = c.TempChunkOutFileName(filename);
             return ExternalSort(filename, c, chunk_out_filename);
-        }).then([filename, chunks, out_filename] () {
+        }).then([filename, &chunks, out_filename] () {
             return MergeChunks(filename, chunks, out_filename); 
         });
     });
