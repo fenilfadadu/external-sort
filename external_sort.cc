@@ -14,7 +14,7 @@
 using namespace std::chrono_literals;
 
 constexpr int64_t kBlobSize = 4096;
-constexpr int64_t kMergeFactor = 64;
+constexpr int64_t kMergeFactor = 5;
 constexpr char kSortedFileSuffix[] = ".sorted";
 
 int64_t AvailableRam() {
